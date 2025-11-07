@@ -1,19 +1,19 @@
 use crate::crypto::hash;
 use crate::util;
-use ed25519_dalek::ed25519::signature::rand_core::OsRng;
-use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
-use ed25519_dalek::pkcs8::spki::der::zeroize::Zeroizing;
-use ed25519_dalek::pkcs8::{DecodePrivateKey, DecodePublicKey, EncodePrivateKey, EncodePublicKey};
-use ed25519_dalek::{Signer, Verifier};
+use crabgraph::asym::{Ed25519KeyPair, Ed25519PublicKey, Ed25519Signature};
+
+// Import RSA types from crabgraph for legacy client support
+#[cfg(feature = "crypto")]
+use crabgraph::asym::{RsaPublicKey, RsaSignature};
 
 pub struct SigningTokenKey {
-    inner: ed25519_dalek::SigningKey,
+    inner: Ed25519KeyPair,
 }
 
 impl SigningTokenKey {
     pub fn to_verifying_key(&self) -> Box<dyn VerifyingTokenKey> {
         Box::new(Ed25519VerifyingKey {
-            inner: self.inner.verifying_key(),
+            inner: self.inner.public_key(),
         })
     }
 }
@@ -27,22 +27,27 @@ pub trait VerifyingTokenKey {
 }
 
 struct Ed25519VerifyingKey {
-    inner: ed25519_dalek::VerifyingKey,
+    inner: Ed25519PublicKey,
 }
 
+#[cfg(feature = "crypto")]
 struct RsaPssVerifyingKey {
-    inner: rsa::pss::VerifyingKey<sha2::Sha256>,
+    inner: RsaPublicKey,
 }
 
 impl VerifyingTokenKey for Ed25519VerifyingKey {
     fn verify(&self, msg: &[u8], signature: &[u8]) -> anyhow::Result<()> {
-        let signature = ed25519_dalek::Signature::from_slice(signature)?;
-        self.inner.verify(msg, &signature)?;
+        let sig = Ed25519Signature::from_bytes(signature)?;
+        let valid = self.inner.verify(msg, &sig)?;
+        
+        if !valid {
+            anyhow::bail!("Invalid signature");
+        }
         Ok(())
     }
 
     fn to_der(&self) -> anyhow::Result<Vec<u8>> {
-        Ok(self.inner.to_public_key_der()?.into_vec())
+        Ok(self.inner.to_public_key_der()?)
     }
 
     fn signature_method(&self) -> &'static str {
@@ -50,15 +55,24 @@ impl VerifyingTokenKey for Ed25519VerifyingKey {
     }
 }
 
+#[cfg(feature = "crypto")]
 impl VerifyingTokenKey for RsaPssVerifyingKey {
     fn verify(&self, msg: &[u8], signature: &[u8]) -> anyhow::Result<()> {
-        let signature = rsa::pss::Signature::try_from(signature)?;
-        self.inner.verify(msg, &signature)?;
+        let sig = RsaSignature::from_bytes(signature.to_vec());
+        let valid = self.inner.verify(msg, &sig)?;
+        
+        if !valid {
+            anyhow::bail!("Invalid RSA-PSS signature");
+        }
         Ok(())
     }
 
     fn to_der(&self) -> anyhow::Result<Vec<u8>> {
-        Ok(self.inner.to_public_key_der()?.into_vec())
+        // TODO: crabgraph doesn't expose direct DER access yet,
+        // so we have to roundtrip through base64 (inefficient but works)
+        let b64 = self.inner.to_base64()?;
+        let der = crate::util::base64::decode(&b64)?;
+        Ok(der)
     }
 
     fn signature_method(&self) -> &'static str {
@@ -67,27 +81,24 @@ impl VerifyingTokenKey for RsaPssVerifyingKey {
 }
 
 pub fn generate_key() -> SigningTokenKey {
-    let mut csprng = OsRng;
-    SigningTokenKey {
-        inner: ed25519_dalek::SigningKey::generate(&mut csprng),
-    }
+    let keypair = Ed25519KeyPair::generate()
+        .expect("Failed to generate Ed25519 keypair");
+    
+    SigningTokenKey { inner: keypair }
 }
 
-pub fn export_private_key(key: &SigningTokenKey) -> anyhow::Result<Zeroizing<String>> {
-    let pem = key.inner.to_pkcs8_pem(LineEnding::LF)?;
+pub fn export_private_key(key: &SigningTokenKey) -> anyhow::Result<String> {
+    let pem = key.inner.to_pkcs8_pem()?;
     Ok(pem)
 }
 
 pub fn parse_private_key(private_key: &str) -> anyhow::Result<SigningTokenKey> {
-    let parsed = ed25519_dalek::SigningKey::from_pkcs8_pem(private_key)?;
+    let parsed = Ed25519KeyPair::from_pkcs8_pem(private_key)?;
     Ok(SigningTokenKey { inner: parsed })
 }
 
 pub fn export_public_key(key: &SigningTokenKey) -> anyhow::Result<String> {
-    let pem = key
-        .inner
-        .verifying_key()
-        .to_public_key_pem(LineEnding::LF)?;
+    let pem = key.inner.public_key().to_public_key_pem()?;
     Ok(pem)
 }
 
@@ -97,14 +108,14 @@ pub fn parse_public_key(
 ) -> anyhow::Result<Box<dyn VerifyingTokenKey + Send>> {
     Ok(match identifier {
         "ed25519" => Box::new(Ed25519VerifyingKey {
-            inner: ed25519_dalek::VerifyingKey::from_public_key_pem(public_key)?,
+            inner: Ed25519PublicKey::from_public_key_pem(public_key)?,
         }),
+        #[cfg(feature = "crypto")]
         "rsa-pss" => Box::new(RsaPssVerifyingKey {
-            inner: {
-                let public_key = rsa::RsaPublicKey::from_public_key_pem(public_key)?;
-                rsa::pss::VerifyingKey::new(public_key)
-            },
+            inner: RsaPublicKey::from_pem(public_key)?,
         }),
+        #[cfg(not(feature = "crypto"))]
+        "rsa-pss" => return Err(anyhow::anyhow!("RSA support requires 'crypto' feature")),
         _ => return Err(anyhow::anyhow!("Unsupported key type")),
     })
 }
@@ -116,23 +127,26 @@ pub fn generate_token_timestamp(key: &SigningTokenKey) -> anyhow::Result<String>
 }
 
 pub fn generate_token_nonce(key: &SigningTokenKey, salt: &[u8]) -> anyhow::Result<String> {
+    // Construct hash input from public key DER + salt
     let digest = {
-        let public_key = key.inner.verifying_key().to_public_key_der()?;
-        let hash_input = [public_key.as_bytes(), &salt].concat();
-        hash::sha256(&hash_input)
+        let pubkey_der = key.inner.public_key().to_public_key_der()?;
+        let combined = [pubkey_der.as_slice(), salt].concat();
+        hash::sha256(&combined)
     };
+    
     let signature = key.inner.sign(&digest);
 
+    // Build token string: hash_method.hash_b64.salt_b64.sign_method.signature_b64
     let hash_method = "sha256";
     let hash_base64 = util::base64::encode(&digest);
-    let salt_base64 = util::base64::encode(&salt);
+    let salt_base64 = util::base64::encode(salt);
     let sign_method = "ed25519";
-    let signature_base64 = util::base64::encode(signature.to_bytes());
+    let signature_base64 = util::base64::encode(signature.as_bytes());
 
-    let result =
-        format!("{hash_method}.{hash_base64}.{salt_base64}.{sign_method}.{signature_base64}");
-
-    Ok(result)
+    Ok(format!(
+        "{}.{}.{}.{}.{}",
+        hash_method, hash_base64, salt_base64, sign_method, signature_base64
+    ))
 }
 
 pub fn extract_signature_identifier(token: &str) -> Option<&str> {
@@ -181,40 +195,43 @@ pub fn verify_token_with_result(
 ) -> anyhow::Result<()> {
     let parts: Vec<&str> = token.split('.').collect();
     let [hash_method, hash_base64, salt_base64, sign_method, signature_base64] = parts[0..5] else {
-        return Err(anyhow::anyhow!("Invalid structure"));
+        anyhow::bail!("Invalid token structure");
     };
 
     if hash_method != "sha256" {
-        return Err(anyhow::anyhow!("Invalid hash method"));
+        anyhow::bail!("Unsupported hash method: {}", hash_method);
     }
 
     if sign_method != public_key.signature_method() {
-        return Err(anyhow::anyhow!("Invalid sign method"));
+        anyhow::bail!("Signature method mismatch: expected {}, got {}", 
+            public_key.signature_method(), sign_method);
     }
 
+    // Decode and validate salt
     let salt = {
         let salt_bytes = util::base64::decode(salt_base64)?;
         verify_salt(&salt_bytes)?;
         salt_bytes
     };
 
+    // Reconstruct digest from public key + salt
     let digest = {
-        let public_key_der = public_key.to_der()?;
-        let hash_input = [public_key_der.as_slice(), &salt].concat();
-        hash::sha256(&hash_input)
+        let pubkey_der = public_key.to_der()?;
+        let combined = [pubkey_der.as_slice(), &salt].concat();
+        hash::sha256(&combined)
     };
 
+    // Verify hash matches
     if util::base64::encode(&digest) != hash_base64 {
-        return Err(anyhow::anyhow!("Hash mismatch"));
+        anyhow::bail!("Hash mismatch");
     }
 
-    let Ok(signature) = util::base64::decode(signature_base64) else {
-        return Err(anyhow::anyhow!("Invalid signature base64 encoding"));
-    };
+    // Decode and verify signature
+    let signature = util::base64::decode(signature_base64)
+        .map_err(|_| anyhow::anyhow!("Invalid signature encoding"))?;
 
-    public_key
-        .verify(&digest, &signature)
-        .map_err(|_| anyhow::anyhow!("Invalid signature"))?;
+    public_key.verify(&digest, &signature)
+        .map_err(|_| anyhow::anyhow!("Signature verification failed"))?;
 
     Ok(())
 }
@@ -229,7 +246,9 @@ mod tests {
         let pem = export_private_key(&key).unwrap();
 
         let parsed = parse_private_key(&pem).unwrap();
-        assert_eq!(parsed.inner.as_bytes(), key.inner.as_bytes());
+        let original_bytes = key.inner.secret_bytes();
+        let parsed_bytes = parsed.inner.secret_bytes();
+        assert_eq!(parsed_bytes, original_bytes);
     }
 
     #[test]
@@ -239,7 +258,7 @@ mod tests {
         let signature = key.inner.sign(data);
         let verified = key
             .to_verifying_key()
-            .verify(data, signature.to_vec().as_ref())
+            .verify(data, signature.as_bytes())
             .is_ok();
         assert!(verified);
     }

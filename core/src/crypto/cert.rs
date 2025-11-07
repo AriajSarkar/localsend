@@ -1,9 +1,18 @@
+#[cfg(feature = "http")]
 use std::io::Cursor;
+
+#[cfg(feature = "http")]
+use pem;
+#[cfg(feature = "http")]
 use x509_parser::asn1_rs::FromDer;
+#[cfg(feature = "http")]
 use x509_parser::certificate::X509Certificate;
+#[cfg(feature = "http")]
 use x509_parser::pem::Pem;
+#[cfg(feature = "http")]
 use x509_parser::x509::SubjectPublicKeyInfo;
 
+#[cfg(feature = "http")]
 pub fn verify_cert_from_pem(cert: String, public_key: Option<String>) -> anyhow::Result<()> {
     let (cert_pem, _) = Pem::read(Cursor::new(cert.into_bytes()))?;
     let parsed_cert: X509Certificate = cert_pem.parse_x509()?;
@@ -11,6 +20,7 @@ pub fn verify_cert_from_pem(cert: String, public_key: Option<String>) -> anyhow:
     verify_cert_from_cert(parsed_cert, public_key)
 }
 
+#[cfg(feature = "http")]
 pub fn verify_cert_from_der(cert: &[u8], public_key: Option<String>) -> anyhow::Result<()> {
     let (_, parsed_cert) = X509Certificate::from_der(&cert)?;
 
@@ -21,6 +31,7 @@ pub fn verify_cert_from_der(cert: &[u8], public_key: Option<String>) -> anyhow::
 /// - according to the signature
 /// - according to the time validity
 /// - according to the public key (if provided)
+#[cfg(feature = "http")]
 fn verify_cert_from_cert(cert: X509Certificate, public_key: Option<String>) -> anyhow::Result<()> {
     if !cert.validity.is_valid() {
         return Err(anyhow::anyhow!("Time validity error"));
@@ -45,6 +56,7 @@ fn verify_cert_from_cert(cert: X509Certificate, public_key: Option<String>) -> a
     Ok(())
 }
 
+#[cfg(feature = "http")]
 pub fn public_key_from_cert_pem(cert: String) -> anyhow::Result<String> {
     let (cert_pem, _) = Pem::read(Cursor::new(cert.into_bytes()))?;
     let parsed_cert: X509Certificate = cert_pem.parse_x509()?;
@@ -53,6 +65,7 @@ pub fn public_key_from_cert_pem(cert: String) -> anyhow::Result<String> {
 
 /// Extracts the public key from the certificate which is in DER format.
 /// Encodes the public key in PEM format.
+#[cfg(feature = "http")]
 pub fn public_key_from_cert_der(cert: &[u8]) -> anyhow::Result<String> {
     let (_, parsed_cert) = X509Certificate::from_der(&cert)?;
     public_key_from_cert(parsed_cert)
@@ -60,13 +73,14 @@ pub fn public_key_from_cert_der(cert: &[u8]) -> anyhow::Result<String> {
 
 /// Extracts the public key from the certificate.
 /// Encodes the public key in PEM format.
+#[cfg(feature = "http")]
 pub fn public_key_from_cert(cert: X509Certificate) -> anyhow::Result<String> {
     let cert_public_key = cert.tbs_certificate.subject_pki.raw;
     let public_key = pem::encode(&pem::Pem::new("PUBLIC KEY", cert_public_key.to_vec()));
     Ok(public_key)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "http"))]
 mod tests {
     use super::*;
 
