@@ -68,11 +68,7 @@ impl VerifyingTokenKey for RsaPssVerifyingKey {
     }
 
     fn to_der(&self) -> anyhow::Result<Vec<u8>> {
-        // TODO: crabgraph doesn't expose direct DER access yet,
-        // so we have to roundtrip through base64 (inefficient but works)
-        let b64 = self.inner.to_base64()?;
-        let der = crate::util::base64::decode(&b64)?;
-        Ok(der)
+        Ok(self.inner.to_public_key_der()?)
     }
 
     fn signature_method(&self) -> &'static str {
